@@ -12,12 +12,15 @@ class PaperlessService {
     this.customFieldCache = new Map();
     this.lastTagRefresh = 0;
     this.CACHE_LIFETIME = 3000; // 3 Sekunden
+    this.REQUEST_TIMEOUT_MS = Number(process.env.PAPERLESS_API_TIMEOUT_MS) || 15000;
+    this.RETRY_ATTEMPTS = Number(process.env.PAPERLESS_API_RETRY_ATTEMPTS) || 1;
   }
 
   initialize() {
     if (!this.client && config.paperless.apiUrl && config.paperless.apiToken) {
       this.client = axios.create({
         baseURL: config.paperless.apiUrl,
+        timeout: this.REQUEST_TIMEOUT_MS,
         headers: {
           'Authorization': `Token ${config.paperless.apiToken}`,
           'Content-Type': 'application/json'
@@ -115,6 +118,7 @@ class PaperlessService {
   async initializeWithCredentials(apiUrl, apiToken) {
     this.client = axios.create({
       baseURL: apiUrl,
+      timeout: this.REQUEST_TIMEOUT_MS,
       headers: {
         'Authorization': `Token ${apiToken}`,
         'Content-Type': 'application/json'
@@ -129,6 +133,33 @@ class PaperlessService {
       console.error('[ERROR] Failed to initialize with credentials:', error.message);
       this.client = null;
       return false;
+    }
+  }
+
+  isRetryableRequestError(error) {
+    if (!error) return false;
+    if (error.code && ['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE'].includes(error.code)) {
+      return true;
+    }
+    const message = String(error.message || '').toLowerCase();
+    return message.includes('timeout') || message.includes('timed out');
+  }
+
+  async requestWithRetry(requestFn, description) {
+    let attempt = 0;
+    while (true) {
+      try {
+        return await requestFn();
+      } catch (error) {
+        if (attempt < this.RETRY_ATTEMPTS && this.isRetryableRequestError(error)) {
+          const delayMs = 500 * (attempt + 1);
+          console.warn(`[WARN] ${description} failed (${error.code || error.message}); retrying in ${delayMs}ms`);
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+          attempt += 1;
+          continue;
+        }
+        throw error;
+      }
     }
   }
 
@@ -1340,7 +1371,10 @@ async getOrCreateDocumentType(name) {
       }
       
       console.log('[DEBUG] Final update data:', updateData);
-      await this.client.patch(`/documents/${documentId}/`, updateData);
+      await this.requestWithRetry(
+        () => this.client.patch(`/documents/${documentId}/`, updateData),
+        `PATCH /documents/${documentId}/`
+      );
       console.log(`[SUCCESS] Updated document ${documentId} with:`, updateData);
       return await this.getDocument(documentId);
     } catch (error) {
